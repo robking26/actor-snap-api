@@ -36,7 +36,26 @@ async function run({ token = () => TOKEN, query = { id: "69", token: TOKEN }, me
     },
   });
   const res = makeRes();
-  await handler({ method, query, headers: {} }, res);
+  // A url alongside query, because the handler falls back to parsing it.
+  const search = new URLSearchParams(
+    Object.entries(query ?? {}).filter(([, v]) => v !== undefined).map(([k, v]) => [k, String(v)])
+  ).toString();
+  await handler({ method, query, headers: {}, url: `/api/v2/fixture?${search}` }, res);
+  return { res, calls };
+}
+
+// No req.query at all, to prove the URL fallback carries it.
+async function runRaw({ url }) {
+  const calls = [];
+  const handler = createFixtureHandler({
+    token: () => TOKEN,
+    limiter: createLimiter(),
+    limits: { perAddress: { limit: 30, windowMs: HOUR }, global: { limit: 500, windowMs: DAY } },
+    log: { error() {} },
+    tmdbGet: async (path) => { calls.push(path); return person; },
+  });
+  const res = makeRes();
+  await handler({ method: "GET", headers: {}, url }, res);
   return { res, calls };
 }
 
@@ -61,8 +80,35 @@ await t("401 on a wrong token", async () => {
   assert.deepEqual(calls, [], "must not reach TMDB");
 });
 
-await t("401 on a missing token", async () => {
+await t("401 on a missing token, and says which kind of 401 it is", async () => {
   const { res } = await run({ query: { id: "69" } });
+  assert.equal(code(res), "unauthorised");
+  assert.equal(res.body.error.details.reason, "missing");
+});
+
+await t("a wrong token reports a mismatch, not a missing one", async () => {
+  const { res } = await run({ query: { id: "69", token: "nope" } });
+  assert.equal(res.body.error.details.reason, "mismatch");
+});
+
+await t("a token pasted with trailing whitespace still matches", async () => {
+  // What a dashboard field does to a pasted value more often than anyone expects.
+  const { res } = await run({ token: () => `${TOKEN}\n` });
+  assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+});
+
+await t("the token is read from the URL when req.query is absent", async () => {
+  const handlerRun = await runRaw({ url: `/api/v2/fixture?id=69&token=${TOKEN}` });
+  assert.equal(handlerRun.res.statusCode, 200, JSON.stringify(handlerRun.res.body));
+});
+
+await t("the id is read from the URL when req.query is absent", async () => {
+  const handlerRun = await runRaw({ url: `/api/v2/fixture?token=${TOKEN}` });
+  assert.equal(code(handlerRun.res), "invalid_id");
+});
+
+await t("a token given twice is refused rather than guessed at", async () => {
+  const { res } = await run({ query: { id: "69", token: [TOKEN, "nope"] } });
   assert.equal(code(res), "unauthorised");
 });
 
