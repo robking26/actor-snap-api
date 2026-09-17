@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node test/v2.test.mjs"
+    "test": "node test/v2.test.mjs && node test/fixture.test.mjs"
   },
   "keywords": [],
   "author": "",
