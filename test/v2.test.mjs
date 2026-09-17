@@ -1,6 +1,7 @@
 import { Readable } from "node:stream";
 import assert from "node:assert/strict";
 import { createHandler, MAX_IMAGE_BYTES } from "../lib/hoozat.js";
+import { createLimiter, DEFAULT_LIMITS } from "../lib/rate-limit.js";
 
 const JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(100)]);
 const PNG = Buffer.concat([Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]), Buffer.alloc(50)]);
@@ -26,9 +27,10 @@ const person = {
   ] },
 };
 
-function makeReq({ method = "POST", key = KEY, body = JPEG } = {}) {
+function makeReq({ method = "POST", key = KEY, body = JPEG, address } = {}) {
   const r = Readable.from(body.length ? [body] : []);
   r.method = method; r.headers = key == null ? {} : { "x-hoozat-key": key };
+  if (address) r.headers["x-forwarded-for"] = address;
   return r;
 }
 function makeRes() {
@@ -46,6 +48,8 @@ function handlerWith(o = {}) {
     recognise: o.recognise ?? (async () => ({ CelebrityFaces: [ineson], UnrecognizedFaces: [] })),
     tmdbGet: async (path, params) => { calls.push(path); return (o.tmdbGet ?? defaultTmdb)(path, params); },
     log: silent,
+    ...(o.limiter ? { limiter: o.limiter } : {}),
+    ...(o.limits ? { limits: o.limits } : {}),
   });
   return { h, calls };
 }
@@ -133,4 +137,66 @@ await t("unknown gender → they/their, empty bio → null, medium confidence", 
   const { res } = await run({ recognise: async () => ({ CelebrityFaces: [{ ...ineson, MatchConfidence: 90 }] }), tmdbGet: async (p) => p.startsWith("/find") ? { person_results: [{ id: 69 }] } : { ...person, gender: 0, biography: "  " } });
   assert.equal(res.body.person.pronouns.possessive, "their"); assert.equal(res.body.person.biography, null); assert.equal(res.body.match.confidenceLevel, "medium");
 });
+// ---- rate limiting ----
+await t("under the per-address limit, requests pass", async () => {
+  const limits = { perAddress: { limit: 3, windowMs: 1000 }, global: DEFAULT_LIMITS.global };
+  const { h } = handlerWith({ limiter: createLimiter(), limits });
+  for (let i = 0; i < 3; i++) {
+    const res = makeRes();
+    await h(makeReq({ address: "1.2.3.4" }), res);
+    assert.equal(res.statusCode, 200);
+  }
+});
+
+await t("429 rate_limited once the per-address limit is passed", async () => {
+  const limits = { perAddress: { limit: 2, windowMs: 1000 }, global: DEFAULT_LIMITS.global };
+  const { h } = handlerWith({ limiter: createLimiter(), limits });
+  for (let i = 0; i < 2; i++) await h(makeReq({ address: "1.2.3.4" }), makeRes());
+  const res = makeRes();
+  await h(makeReq({ address: "1.2.3.4" }), res);
+  assert.equal(res.statusCode, 429);
+  assert.equal(code(res), "rate_limited");
+  assert.ok(Number(res.headers["Retry-After"]) >= 1, "Retry-After is set");
+});
+
+await t("a throttled request never reaches Rekognition", async () => {
+  let recognitions = 0;
+  const limits = { perAddress: { limit: 1, windowMs: 1000 }, global: DEFAULT_LIMITS.global };
+  const { h } = handlerWith({
+    limiter: createLimiter(), limits,
+    recognise: async () => { recognitions++; return { CelebrityFaces: [ineson], UnrecognizedFaces: [] }; },
+  });
+  await h(makeReq({ address: "5.6.7.8" }), makeRes());
+  await h(makeReq({ address: "5.6.7.8" }), makeRes());
+  assert.equal(recognitions, 1, "the second, throttled request must not call Rekognition");
+});
+
+await t("addresses are counted separately", async () => {
+  const limits = { perAddress: { limit: 1, windowMs: 1000 }, global: DEFAULT_LIMITS.global };
+  const { h } = handlerWith({ limiter: createLimiter(), limits });
+  await h(makeReq({ address: "1.1.1.1" }), makeRes());
+  const res = makeRes();
+  await h(makeReq({ address: "2.2.2.2" }), res);
+  assert.equal(res.statusCode, 200, "a different address has its own allowance");
+});
+
+await t("the global ceiling applies across addresses", async () => {
+  const limits = { perAddress: { limit: 99, windowMs: 1000 }, global: { limit: 2, windowMs: 1000 } };
+  const { h } = handlerWith({ limiter: createLimiter(), limits });
+  await h(makeReq({ address: "1.1.1.1" }), makeRes());
+  await h(makeReq({ address: "2.2.2.2" }), makeRes());
+  const res = makeRes();
+  await h(makeReq({ address: "3.3.3.3" }), res);
+  assert.equal(res.statusCode, 429, "the global ceiling ignores which address asked");
+});
+
+await t("an unauthorised request does not consume quota", async () => {
+  const limits = { perAddress: { limit: 1, windowMs: 1000 }, global: DEFAULT_LIMITS.global };
+  const { h } = handlerWith({ limiter: createLimiter(), limits });
+  await h(makeReq({ address: "9.9.9.9", key: "wrong" }), makeRes());
+  const res = makeRes();
+  await h(makeReq({ address: "9.9.9.9" }), res);
+  assert.equal(res.statusCode, 200, "the rejected request must not have used the allowance");
+});
+
 console.log(`\n${n} tests passed`);
