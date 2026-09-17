@@ -83,6 +83,12 @@ await t("largest celebrity chosen among several", async () => {
 });
 await t("415 mapped from Rekognition InvalidImageFormatException", async () => { const { res } = await run({ recognise: async () => { throw Object.assign(new Error("x"), { name: "InvalidImageFormatException" }); } }); assert.equal(res.statusCode, 415); });
 await t("503 on Rekognition throttling", async () => { const { res } = await run({ recognise: async () => { throw Object.assign(new Error("x"), { name: "ThrottlingException" }); } }); assert.equal(res.statusCode, 503); });
+await t("502 carries the AWS error name so it can be diagnosed without server logs", async () => {
+  const { res } = await run({ recognise: async () => { throw Object.assign(new Error("no"), { name: "UnrecognizedClientException" }); } });
+  assert.equal(res.statusCode, 502);
+  assert.equal(code(res), "recognition_unavailable");
+  assert.equal(res.body.error.details.reason, "UnrecognizedClientException");
+});
 await t("502 on Rekognition unknown error", async () => { const { res } = await run({ recognise: async () => { throw new Error("boom"); } }); assert.equal(code(res), "recognition_unavailable"); });
 await t("502 on TMDB auth failure", async () => { const { res } = await run({ tmdbGet: async () => { throw Object.assign(new Error("401"), { response: { status: 401, data: {} } }); } }); assert.equal(code(res), "profile_unavailable"); });
 
