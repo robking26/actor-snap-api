@@ -107,6 +107,15 @@ await t("the id is read from the URL when req.query is absent", async () => {
   assert.equal(code(handlerRun.res), "invalid_id");
 });
 
+await t("a search failure is a 502, not a 500", async () => {
+  const { res } = await run({
+    query: { name: "Ralph Ineson", token: TOKEN },
+    tmdbGet: async () => { throw Object.assign(new Error("401"), { response: { status: 401 } }); },
+  });
+  assert.equal(res.statusCode, 502);
+  assert.equal(code(res), "profile_unavailable");
+});
+
 await t("a token given twice is refused rather than guessed at", async () => {
   const { res } = await run({ query: { id: "69", token: [TOKEN, "nope"] } });
   assert.equal(code(res), "unauthorised");
@@ -118,11 +127,53 @@ await t("405 on anything but GET", async () => {
   assert.equal(res.headers.allow, "GET");
 });
 
-await t("400 on a missing or nonsense id", async () => {
+await t("400 when nobody is named", async () => {
   for (const id of [undefined, "", "abc", "-1", "0", "1.5"]) {
     const { res } = await run({ query: { id, token: TOKEN } });
     assert.equal(code(res), "invalid_id", `id=${String(id)}`);
   }
+});
+
+await t("a name resolves through the same exact match identify uses", async () => {
+  const searchResults = { results: [
+    { id: 1, name: "Ralph Inesonn", known_for_department: "Acting", popularity: 99 },
+    { id: 69, name: "Ralph Ineson", known_for_department: "Acting", popularity: 10 },
+  ] };
+  const { res, calls } = await run({
+    query: { name: "Ralph Ineson", token: TOKEN },
+    tmdbGet: async (path) => (path === "/search/person" ? searchResults : person),
+  });
+  assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+  assert.deepEqual(calls, ["/search/person", "/person/69"]);
+  // Found by name, so it says so rather than claiming an IMDb match.
+  assert.equal(res.body.match.method, "name");
+});
+
+await t("a name with no exact match is a 404, not the nearest thing", async () => {
+  const { res } = await run({
+    query: { name: "Ralf Ineson", token: TOKEN },
+    tmdbGet: async (path) => (path === "/search/person"
+      ? { results: [{ id: 1, name: "Ralph Ineson", known_for_department: "Acting", popularity: 99 }] }
+      : person),
+  });
+  assert.equal(res.statusCode, 404);
+  assert.equal(code(res), "person_not_found");
+});
+
+await t("an imdb id resolves through /find", async () => {
+  const { res, calls } = await run({
+    query: { imdb: "nm0408506", token: TOKEN },
+    tmdbGet: async (path) => (path.startsWith("/find/") ? { person_results: [{ id: 69 }] } : person),
+  });
+  assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+  assert.deepEqual(calls, ["/find/nm0408506", "/person/69"]);
+  assert.equal(res.body.match.method, "imdb");
+});
+
+await t("an explicit id wins and skips the lookup entirely", async () => {
+  const { res, calls } = await run({ query: { id: "69", name: "Someone Else", token: TOKEN } });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(calls, ["/person/69"]);
 });
 
 await t("404 when TMDB has no such person", async () => {
