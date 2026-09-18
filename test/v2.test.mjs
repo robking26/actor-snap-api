@@ -94,7 +94,11 @@ await t("502 on TMDB auth failure", async () => { const { res } = await run({ tm
 
 await t("200 via IMDb ID — no name search", async () => {
   const { res, calls } = await run({});
-  assert.equal(res.statusCode, 200); assert.deepEqual(calls, ["/find/nm0408506", "/person/69"]);
+  assert.equal(res.statusCode, 200);
+  // The run-length lookups follow the profile. Asserted as a set rather than a sequence:
+  // they go out together, so the order they land in is not a promise worth keeping.
+  assert.deepEqual(calls.slice(0, 2), ["/find/nm0408506", "/person/69"]);
+  assert.deepEqual(new Set(calls.slice(2)), new Set(["/tv/87108", "/tv/207703"]));
   const b = res.body;
   assert.equal(b.match.method, "imdb"); assert.equal(b.match.confidence, 0.992); assert.equal(b.match.confidenceLevel, "high");
   assert.equal(b.person.firstName, "Ralph"); assert.equal(b.person.pronouns.possessive, "his");
@@ -123,6 +127,44 @@ await t("notable excludes talk shows, playing self, posterless", async () => {
   assert.ok(titles.includes("Chernobyl") && titles.includes("Kingsman: The Secret Service"));
   console.log("   notable order:", titles.join(" | "));
 });
+await t("television ranks on share of the run, not episodes counted", async () => {
+  // Chernobyl: 3 of 5, a majority of a short run. ID collision show: 8 of 400, a walk-on
+  // of a long one. Counting episodes has the walk-on ahead on 8 against 3; sharing the
+  // run puts it behind, which is the whole point of the change.
+  const runs = { "/tv/87108": 5, "/tv/207703": 400 };
+  const tmdbGet = async (path) => {
+    if (path.startsWith("/find/")) return { person_results: [{ id: 69 }] };
+    if (path === "/person/69") return person;
+    if (path in runs) return { number_of_episodes: runs[path] };
+    throw Object.assign(new Error("404"), { response: { status: 404 } });
+  };
+  const titles = (await run({ tmdbGet })).res.body.notableCredits.map((c) => c.title);
+  assert.ok(
+    titles.indexOf("Chernobyl") < titles.indexOf("ID collision show"),
+    `a majority of a short run should beat a walk-on in a long one: ${titles.join(" | ")}`
+  );
+  console.log("   with run lengths:", titles.join(" | "));
+});
+
+await t("an unknown run length falls back to counting, and never fails the request", async () => {
+  // The default stub 404s every /tv/ call. A run length that will not load is not worth
+  // losing an identification over, so the response is still a 200 with a full list.
+  const { res } = await run({});
+  assert.equal(res.statusCode, 200);
+  assert.ok(res.body.notableCredits.length > 0);
+  assert.ok(res.body.notableCredits.some((c) => c.title === "Chernobyl"));
+});
+
+await t("a run-length lookup that throws is not a 502", async () => {
+  const tmdbGet = async (path) => {
+    if (path.startsWith("/find/")) return { person_results: [{ id: 69 }] };
+    if (path === "/person/69") return person;
+    throw Object.assign(new Error("500"), { response: { status: 500, data: {} } });
+  };
+  const { res } = await run({ tmdbGet });
+  assert.equal(res.statusCode, 200);
+});
+
 await t("name fallback: exact match only, prefers acting + popularity", async () => {
   const tmdbGet = async (path, params) => {
     if (path.startsWith("/find/")) return { person_results: [] };
