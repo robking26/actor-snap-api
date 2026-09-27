@@ -157,4 +157,58 @@ await t("no credits is no request", async () => {
   assert.equal(calls.length, 0);
 });
 
+// ------------------------------------------------- the three silences, which are the bug
+
+// A logger that keeps both levels apart, because the summary goes to `info` so a
+// dashboard filtered to errors cannot lose it.
+function loud() {
+  const info = [], error = [];
+  return { info: (...a) => info.push(a.join(" ")), error: (...a) => error.push(a.join(" ")), info_: info, error_: error };
+}
+
+await t("a flawless run still says so — silence is not an answer", async () => {
+  const log = loud();
+  const { request } = recorder(ok({ results: [barbie], missing: [] }));
+  await createColourLookup({ apiKey: () => "k", request, log })(credits);
+
+  assert.equal(log.error_.length, 0, "nothing went wrong");
+  assert.match(log.info_.join(" "), /asked 2 .* 1 returned, 1 coloured/,
+    "and the run reports what it did, so 'no lines at all' can only mean 'not deployed'");
+});
+
+await t("an envelope that is not `results` names its own keys", async () => {
+  const log = loud();
+  const { request } = recorder(ok({ data: [barbie], count: 1 }));
+  const colours = await createColourLookup({ apiKey: () => "k", request, log })(credits);
+
+  assert.equal(colours.size, 0);
+  assert.match(log.error_.join(" "), /no `results` array/);
+  assert.match(log.error_.join(" "), /\[data, count\]/, "the fix is in the keys, so they are in the line");
+  assert.match(log.info_.join(" "), /envelope keys \[data, count\]/);
+});
+
+await t("colors present but in another shape is not the same as colors: null", async () => {
+  const log = loud();
+  const { request } = recorder(ok({ results: [
+    { ...barbie, colors: { primary: "#ED2FB9", secondary: "#36C2FB", tertiary: "#DAEDFF" } },
+    { media_type: "tv", tmdb_id: 1399, colors: null },
+  ]}));
+  const colours = await createColourLookup({ apiKey: () => "k", request, log })(credits);
+
+  assert.equal(colours.size, 0);
+  assert.match(log.error_.join(" "), /colors did not parse/);
+  assert.match(log.error_.join(" "), /#ED2FB9/, "the shape that arrived is what makes it fixable");
+  assert.match(log.info_.join(" "), /1 unparseable/, "and colors: null is not counted as one");
+});
+
+await t("the noisy cases are reported once, not once per title", async () => {
+  const log = loud();
+  const many = Array.from({ length: 50 }, (_, i) => ({ media_type: "movie", tmdb_id: i, colors: { primary: "x" } }));
+  const { request } = recorder(ok({ results: many }));
+  await createColourLookup({ apiKey: () => "k", request, log })(credits);
+
+  assert.equal(log.error_.length, 1, "three hundred rows must not be three hundred lines");
+  assert.match(log.info_.join(" "), /50 unparseable/, "the count carries the rest");
+});
+
 console.log(`\n${n} tests passed`);
