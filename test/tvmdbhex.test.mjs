@@ -14,7 +14,9 @@ const barbie = { media_type: "movie", tmdb_id: 346698, colors: hexes };
 function recorder(reply) {
   const calls = [];
   const request = async (url, init) => {
-    calls.push({ url, init, body: JSON.parse(init.body) });
+    // `body` only where there is one: the probe is a GET, and `JSON.parse(undefined)`
+    // throws — which silently cost this helper a recorded call once.
+    calls.push({ url, init, body: init.body ? JSON.parse(init.body) : null });
     return typeof reply === "function" ? reply(calls.length) : reply;
   };
   return { calls, request };
@@ -209,6 +211,49 @@ await t("the noisy cases are reported once, not once per title", async () => {
 
   assert.equal(log.error_.length, 1, "three hundred rows must not be three hundred lines");
   assert.match(log.info_.join(" "), /50 unparseable/, "the count carries the rest");
+});
+
+// ------------------------------------------------- telling whose fault a 500 is
+
+await t("a failed batch probes one title, and names which side is broken", async () => {
+  const log = loud();
+  const { calls, request } = recorder((call) => (call === 1 ? bad(500, "Internal Server Error") : ok(barbie)));
+  await createColourLookup({ apiKey: () => "k", request, log })(credits);
+
+  assert.equal(calls.length, 2, "one probe, not one request per title");
+  assert.equal(calls[1].url, "https://tvmdbhex.vercel.app/v1/movie/346698");
+  assert.equal(calls[1].init.method, "GET");
+  assert.equal(calls[1].init.headers["X-API-Key"], "k");
+  assert.match(log.error_.join(" "), /\/v1\/lookup is the broken part/);
+});
+
+await t("a 401 on the probe says it is the key", async () => {
+  const log = loud();
+  const { request } = recorder((call) => (call === 1 ? bad(500) : bad(401)));
+  await createColourLookup({ apiKey: () => "bad", request, log })(credits);
+  assert.match(log.error_.join(" "), /the key is wrong or not set on tvmdbhex/);
+});
+
+await t("a 404 on the probe still means the service is up", async () => {
+  const log = loud();
+  const { request } = recorder((call) => (call === 1 ? bad(500) : bad(404)));
+  await createColourLookup({ apiKey: () => "k", request, log })(credits);
+  assert.match(log.error_.join(" "), /the key works and the service is up/);
+});
+
+await t("a probe that cannot be made is not a second failure to chase", async () => {
+  const log = loud();
+  let n = 0;
+  const request = async () => { n += 1; if (n === 1) return bad(500); throw new Error("ECONNRESET"); };
+  const colours = await createColourLookup({ apiKey: () => "k", request, log })(credits);
+  assert.equal(colours.size, 0);
+  assert.match(log.error_.join(" "), /probe .* could not be made/);
+});
+
+await t("a run that works never probes", async () => {
+  const { calls, request } = recorder(ok({ results: [barbie] }));
+  await createColourLookup({ apiKey: () => "k", request, log: silent })(credits);
+  assert.equal(calls.length, 1, "the probe costs nothing when there is nothing wrong");
 });
 
 console.log(`\n${n} tests passed`);
