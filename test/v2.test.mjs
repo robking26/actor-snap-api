@@ -50,6 +50,7 @@ function handlerWith(o = {}) {
     log: silent,
     ...(o.limiter ? { limiter: o.limiter } : {}),
     ...(o.limits ? { limits: o.limits } : {}),
+    ...(o.lookupColours ? { lookupColours: o.lookupColours } : {}),
   });
   return { h, calls };
 }
@@ -245,6 +246,91 @@ await t("an unauthorised request does not consume quota", async () => {
   const res = makeRes();
   await h(makeReq({ address: "9.9.9.9" }), res);
   assert.equal(res.statusCode, 200, "the rejected request must not have used the allowance");
+});
+
+// ------------------------------------------------------------ colours on credits
+
+const creditsIn = (res) => res.body.credits;
+const byKey = (res, key) => res.body.credits.find((c) => c.key === key);
+
+await t("every credit carries colours, null when the service has none for it", async () => {
+  const { res } = await run({
+    lookupColours: async () => new Map([["tv:87108", { primary: "#ED2FB9", secondary: "#36C2FB", tertiary: "#DAEDFF" }]]),
+  });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(byKey(res, "tv:87108").colours, { primary: "#ED2FB9", secondary: "#36C2FB", tertiary: "#DAEDFF" });
+  assert.equal(byKey(res, "movie:207703").colours, null, "a title the service has nothing for is null, not missing");
+  assert.ok(creditsIn(res).every((c) => "colours" in c), "the field is on every credit either way");
+});
+
+await t("notableCredits carry them too — the carousel is what they were drawn for", async () => {
+  const { res } = await run({
+    lookupColours: async () => new Map([["tv:87108", { primary: "#111111", secondary: "#222222", tertiary: "#333333" }]]),
+  });
+  const notable = res.body.notableCredits.find((c) => c.key === "tv:87108");
+  assert.deepEqual(notable.colours, { primary: "#111111", secondary: "#222222", tertiary: "#333333" });
+});
+
+await t("a film and a show sharing a TMDB id get their own colours", async () => {
+  const { res } = await run({
+    lookupColours: async () => new Map([["tv:207703", { primary: "#aaaaaa", secondary: "#bbbbbb", tertiary: "#cccccc" }]]),
+  });
+  assert.ok(byKey(res, "tv:207703").colours, "the show has them");
+  assert.equal(byKey(res, "movie:207703").colours, null, "the film with the same id does not");
+});
+
+await t("the lookup is handed every credit, keyed the way the contract keys them", async () => {
+  let seen;
+  await run({ lookupColours: async (credits) => { seen = credits; return new Map(); } });
+  assert.ok(seen.length > 1);
+  assert.ok(seen.every((c) => (c.mediaType === "movie" || c.mediaType === "tv") && Number.isFinite(c.id)));
+});
+
+await t("a lookup that throws does not cost the identification", async () => {
+  const { res } = await run({ lookupColours: async () => { throw new Error("tvmdbhex is down"); } });
+  assert.equal(res.statusCode, 200, "an enrichment must never turn a successful scan into an error");
+  assert.ok(creditsIn(res).every((c) => c.colours === null), "and every card falls back to the brand palette");
+});
+
+await t("a lookup that throws synchronously is caught too", async () => {
+  const { res } = await run({ lookupColours: () => { throw new Error("not even a promise"); } });
+  assert.equal(res.statusCode, 200);
+});
+
+await t("no lookup at all still answers, with every credit null", async () => {
+  const { res } = await run({});
+  assert.equal(res.statusCode, 200);
+  assert.ok(creditsIn(res).every((c) => c.colours === null));
+});
+
+await t("the colour lookup runs beside the run-length fetch, not after it", async () => {
+  // Each waits for the other to have started. Run in sequence this never settles, so the
+  // timeout below is the assertion: it is the claim that colours cost a scan nothing.
+  let runLengthStarted, colourStarted;
+  const runLengthGate = new Promise((r) => (runLengthStarted = r));
+  const colourGate = new Promise((r) => (colourStarted = r));
+
+  const { res } = await Promise.race([
+    run({
+      tmdbGet: async (path, params) => {
+        if (path.startsWith("/tv/")) {
+          runLengthStarted();
+          await colourGate;
+          return { number_of_episodes: 5 };
+        }
+        return defaultTmdb(path, params);
+      },
+      lookupColours: async () => {
+        colourStarted();
+        await runLengthGate;
+        return new Map();
+      },
+    }),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("they ran in sequence — one waited for the other to finish")), 2000)
+    ),
+  ]);
+  assert.equal(res.statusCode, 200);
 });
 
 console.log(`\n${n} tests passed`);

@@ -1,6 +1,7 @@
 import axios from "axios";
 import { RekognitionClient, RecognizeCelebritiesCommand } from "@aws-sdk/client-rekognition";
 import { createHandler } from "../../lib/hoozat.js";
+import { createColourLookup } from "../../lib/tvmdbhex.js";
 import { DEFAULT_LIMITS, HOUR, DAY } from "../../lib/rate-limit.js";
 
 export const config = {
@@ -30,4 +31,9 @@ export default createHandler({
   recognise: (bytes) => rekognition.send(new RecognizeCelebritiesCommand({ Image: { Bytes: bytes } })),
   tmdbGet: async (path, params) =>
     (await tmdb.get(path, { params: { api_key: process.env.TMDB_API_KEY, ...params } })).data,
+  // The key is read per request rather than at module load, so setting it in the Vercel
+  // dashboard takes effect on the next request rather than the next deploy. Without it
+  // every credit's `colours` is null and Hoozat draws its brand palette — see
+  // lib/tvmdbhex.js, which is also where the key never leaving this server is argued.
+  lookupColours: createColourLookup({ apiKey: () => process.env.TVMDBHEX_API_KEY }),
 });
