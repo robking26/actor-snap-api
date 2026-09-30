@@ -47,10 +47,11 @@ function handlerWith(o = {}) {
     appKey: () => ("appKey" in o ? o.appKey : KEY),
     recognise: o.recognise ?? (async () => ({ CelebrityFaces: [ineson], UnrecognizedFaces: [] })),
     tmdbGet: async (path, params) => { calls.push(path); return (o.tmdbGet ?? defaultTmdb)(path, params); },
-    log: silent,
+    log: o.log ?? silent,
     ...(o.limiter ? { limiter: o.limiter } : {}),
     ...(o.limits ? { limits: o.limits } : {}),
     ...(o.lookupColours ? { lookupColours: o.lookupColours } : {}),
+    ...(o.colourBudgetMs ? { colourBudgetMs: o.colourBudgetMs } : {}),
   });
   return { h, calls };
 }
@@ -331,6 +332,44 @@ await t("the colour lookup runs beside the run-length fetch, not after it", asyn
     ),
   ]);
   assert.equal(res.statusCode, 200);
+});
+
+await t("a lookup that never answers does not hold the scan open", async () => {
+  // The fault this was written for: `/v1/lookup` answering 500, the batch spending its
+  // whole timeout, a probe with no timeout running after it — and every card falling
+  // back to the brand palette, which is a complete picture, so nothing on screen said
+  // the scan had paid for it. An enrichment cannot fail a scan and now cannot slow one.
+  const logged = [];
+  const { h } = handlerWith({
+    lookupColours: () => new Promise(() => {}),
+    colourBudgetMs: 20,
+    log: { error: (...a) => logged.push(a.join(" ")) },
+  });
+  const res = makeRes();
+
+  const started = Date.now();
+  await h(makeReq(), res);
+
+  assert.equal(res.statusCode, 200, "the identification still lands");
+  assert.ok(Date.now() - started < 1000, "it did not wait on something it can do without");
+  assert.equal(res.body.credits.every((c) => c.colours === null), true, "every card draws the brand palette");
+  assert.match(logged.join(" "), /gave up after 20ms/, "and the log says which it took");
+});
+
+await t("a lookup that answers inside its budget still colours every card", async () => {
+  // The budget is a ceiling, not a race the healthy case can lose.
+  const { h } = handlerWith({
+    lookupColours: async (credits) => {
+      await new Promise((r) => setTimeout(r, 5));
+      return new Map(credits.map((c) => [c.key, { base: "#0086C7" }]));
+    },
+    colourBudgetMs: 500,
+  });
+  const res = makeRes();
+  await h(makeReq(), res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.credits.every((c) => c.colours?.base === "#0086C7"), true);
 });
 
 console.log(`\n${n} tests passed`);
