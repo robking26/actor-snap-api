@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import {
-  chunk, colourKey, coloursFrom, createColourLookup, resultKey, LOOKUP_BATCH, COLOUR_ROLES,
+  chunk, colourKey, coloursFrom, createColourLookup, resetProbe, resultKey, LOOKUP_BATCH, COLOUR_ROLES,
 } from "../lib/tvmdbhex.js";
 
 let n = 0;
-const t = async (name, fn) => { await fn(); n++; console.log("✓", name); };
+// The probe happens once per process, so every test that wants one has to say so. That is
+// the behaviour under test rather than an inconvenience of it: a diagnostic repeated on
+// every scan is noise, and a test that did not have to reset would be a test proving the
+// old behaviour.
+const t = async (name, fn) => { resetProbe(); await fn(); n++; console.log("✓", name); };
 const silent = { error: () => {} };
 
 // Toy Story's six, which is the palette the app's artwork was drawn against.
@@ -289,6 +293,30 @@ await t("a 404 on the probe still means the service is up", async () => {
   const { request } = recorder((call) => (call === 1 ? bad(500) : bad(404)));
   await createColourLookup({ apiKey: () => "k", request, log })(credits);
   assert.match(log.error_.join(" "), /the key works and the service is up/);
+});
+
+await t("the probe happens once per process, not once per scan", async () => {
+  // A line saying which side is broken is worth having; the same line on every scan of
+  // the same deployment is noise, and it used to be made with no timeout of its own.
+  const log = loud();
+  const { calls, request } = recorder(() => bad(500, "Internal Server Error"));
+  const lookup = createColourLookup({ apiKey: () => "k", request, log });
+
+  await lookup(credits);
+  await lookup(credits);
+  await lookup(credits);
+
+  assert.equal(calls.filter((c) => c.init.method === "GET").length, 1, "one probe across three scans");
+});
+
+await t("the probe carries an abort signal of its own", async () => {
+  // It buys a log line and nothing else, so it must never be the thing holding a
+  // finished identification open. The batch had an AbortController and this had none.
+  const { calls, request } = recorder((call) => (call === 1 ? bad(500) : ok(toyStory)));
+  await createColourLookup({ apiKey: () => "k", request, log: silent })(credits);
+
+  const probeCall = calls.find((c) => c.init.method === "GET");
+  assert.ok(probeCall.init.signal, "the probe is bounded");
 });
 
 await t("a probe that cannot be made is not a second failure to chase", async () => {
