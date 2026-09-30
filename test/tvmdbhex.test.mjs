@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
-  chunk, colourKey, coloursFrom, createColourLookup, resetProbe, resultKey, LOOKUP_BATCH, COLOUR_ROLES,
+  chunk, colourKey, coloursFrom, createColourLookup, resetProbe, resultKey,
+  BATCH_SIZE, LOOKUP_BATCH, COLOUR_ROLES,
 } from "../lib/tvmdbhex.js";
 
 let n = 0;
@@ -126,15 +127,41 @@ await t("a title the service does not hold is simply absent", async () => {
   assert.equal(colours.has("tv:1399"), false, "buildResponse turns a miss into null");
 });
 
-await t("more than the service's ceiling is split, and every batch lands", async () => {
-  const many = Array.from({ length: LOOKUP_BATCH + 1 }, (_, i) => ({ key: `movie:${i}`, id: i, mediaType: "movie" }));
+await t("a filmography goes in chunks, not in one request the size of the ceiling", async () => {
+  // The service accepts 500 in a POST and that is not what it can *answer* quickly: the
+  // first ask for a title produces its palette. Three hundred credits as one request was
+  // why the colours missed on a first scan.
+  const many = Array.from({ length: BATCH_SIZE + 1 }, (_, i) => ({ key: `movie:${i}`, id: i, mediaType: "movie" }));
   const { calls, request } = recorder(() => ok({ results: [] }));
   await createColourLookup({ apiKey: () => "k", request, log: silent })(many);
 
   assert.equal(calls.length, 2);
-  assert.equal(calls[0].body.items.length, LOOKUP_BATCH);
+  assert.equal(calls[0].body.items.length, BATCH_SIZE);
   assert.equal(calls[1].body.items.length, 1);
+  assert.ok(BATCH_SIZE < LOOKUP_BATCH, "the chunk is smaller than the ceiling on purpose");
   assert.equal(chunk([1, 2, 3], 2).length, 2);
+});
+
+await t("the accumulator is filled in place, so giving up early keeps what landed", async () => {
+  // This is what makes the handler's budget a floor rather than a cliff. One chunk
+  // answers, one never does; a caller that stops waiting still has the first one's
+  // colours because they were written into the map it passed in.
+  const many = Array.from({ length: BATCH_SIZE + 1 }, (_, i) => ({ key: `movie:${i}`, id: i, mediaType: "movie" }));
+  const into = new Map();
+  let calls = 0;
+  const request = async () => {
+    calls += 1;
+    if (calls === 1) return ok({ results: [toyStory] });
+    return new Promise(() => {});
+  };
+
+  const lookup = createColourLookup({ apiKey: () => "k", request, log: silent });
+  // Deliberately not awaited to completion: the second chunk never answers.
+  lookup(many, into);
+  await new Promise((r) => setTimeout(r, 10));
+
+  assert.equal(into.size, 1, "the chunk that answered is in the caller's map");
+  assert.equal(into.get("movie:862").base, palette.base);
 });
 
 // ------------------------------------------------------------------ every way it fails
@@ -170,7 +197,7 @@ await t("a request that throws returns what it has rather than throwing on", asy
 });
 
 await t("one batch failing does not take the others with it", async () => {
-  const many = Array.from({ length: LOOKUP_BATCH + 1 }, (_, i) => ({ key: `movie:${i}`, id: i, mediaType: "movie" }));
+  const many = Array.from({ length: BATCH_SIZE + 1 }, (_, i) => ({ key: `movie:${i}`, id: i, mediaType: "movie" }));
   const { request } = recorder((call) =>
     call === 1 ? bad(500) : ok({ results: [{ media_type: "movie", tmdb_id: 500, palette }] })
   );
