@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import {
   chunk, colourKey, coloursFrom, createColourLookup, resetProbe, resultKey,
-  BATCH_SIZE, LOOKUP_BATCH, COLOUR_ROLES,
+  BATCH_SIZE, LOOKUP_BATCH, COLOUR_ROLES, createColourWarmUp,
 } from "../lib/tvmdbhex.js";
 
 let n = 0;
@@ -127,10 +127,14 @@ await t("a title the service does not hold is simply absent", async () => {
   assert.equal(colours.has("tv:1399"), false, "buildResponse turns a miss into null");
 });
 
-await t("a filmography goes in chunks, not in one request the size of the ceiling", async () => {
-  // The service accepts 500 in a POST and that is not what it can *answer* quickly: the
-  // first ask for a title produces its palette. Three hundred credits as one request was
-  // why the colours missed on a first scan.
+await t("a whole filmography is one request, and the ceiling is what splits it", async () => {
+  // **The chunk is the service's own ceiling now, and it was 50.** `/v1/lookup` is a
+  // SELECT — nothing on that path produces a palette — so small chunks bought nothing and
+  // cost a cold start each: a serverless function takes one request at a time, so six
+  // parallel chunks is up to six instances all paying FastAPI's import and a Postgres
+  // connect. That is what "the colours do not load first time" was.
+  //
+  // The chunker stays because the ceiling is real and a partial answer is worth keeping.
   const many = Array.from({ length: BATCH_SIZE + 1 }, (_, i) => ({ key: `movie:${i}`, id: i, mediaType: "movie" }));
   const { calls, request } = recorder(() => ok({ results: [] }));
   await createColourLookup({ apiKey: () => "k", request, log: silent })(many);
@@ -138,8 +142,47 @@ await t("a filmography goes in chunks, not in one request the size of the ceilin
   assert.equal(calls.length, 2);
   assert.equal(calls[0].body.items.length, BATCH_SIZE);
   assert.equal(calls[1].body.items.length, 1);
-  assert.ok(BATCH_SIZE < LOOKUP_BATCH, "the chunk is smaller than the ceiling on purpose");
+  assert.equal(BATCH_SIZE, LOOKUP_BATCH, "one request up to the ceiling, then a second");
   assert.equal(chunk([1, 2, 3], 2).length, 2);
+});
+
+await t("the warm-up asks the real endpoint for nothing at all", async () => {
+  // An empty `items` list pays tvmdbhex's cold start — FastAPI resolves the connection
+  // dependency before the handler body runs — and then executes no query, because the
+  // endpoint's own loop finds no ids. `/health` would boot the process and leave the
+  // Postgres connect for the lookup to pay, which is the half that matters.
+  const { calls, request } = recorder(() => ok({ results: [], missing: [] }));
+  createColourWarmUp({ apiKey: () => "k", request, log: silent })();
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0].url.endsWith("/v1/lookup"), "the path the lookup itself takes");
+  assert.deepEqual(calls[0].body.items, []);
+  assert.equal(calls[0].init.headers["X-API-Key"], "k");
+});
+
+await t("a warm-up that fails is a log line and never a rejection", async () => {
+  // It is fired and not awaited, so a throw here would be an unhandled rejection rather
+  // than a slow scan. A warm-up that does not land costs exactly what not having one
+  // costs, which is why this is not an error.
+  const said = [];
+  const request = async () => { throw new Error("cold"); };
+  createColourWarmUp({
+    apiKey: () => "k",
+    request,
+    log: { info: (...p) => said.push(p.join(" ")) },
+  })();
+  await new Promise((r) => setImmediate(r));
+
+  assert.ok(said.some((line) => line.includes("warm-up did not land")));
+});
+
+await t("no key means no warm-up, and no second complaint about it", async () => {
+  // `lookupColours` already says it once per scan.
+  const { calls, request } = recorder(() => ok({ results: [] }));
+  createColourWarmUp({ apiKey: () => undefined, request, log: silent })();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(calls.length, 0);
 });
 
 await t("the accumulator is filled in place, so giving up early keeps what landed", async () => {
