@@ -356,6 +356,26 @@ await t("a lookup that never answers does not hold the scan open", async () => {
   assert.match(logged.join(" "), /gave up after 20ms/, "and the log says which it took");
 });
 
+await t("a lookup that runs long still ships the colours it had", async () => {
+  // The budget is a floor rather than a cliff. This one writes one title's colours into
+  // the caller's map and then never returns — which is a chunked lookup with one slow
+  // chunk, and the state it is in when the colours are reported missing on a first scan.
+  const { h } = handlerWith({
+    lookupColours: (credits, into) => {
+      into.set(credits[0].key, { base: "#0086C7" });
+      return new Promise(() => {});
+    },
+    colourBudgetMs: 20,
+  });
+  const res = makeRes();
+  await h(makeReq(), res);
+
+  assert.equal(res.statusCode, 200);
+  const coloured = res.body.credits.filter((c) => c.colours !== null);
+  assert.equal(coloured.length, 1, "what landed before the deadline is kept");
+  assert.equal(coloured[0].colours.base, "#0086C7");
+});
+
 await t("a lookup that answers inside its budget still colours every card", async () => {
   // The budget is a ceiling, not a race the healthy case can lose.
   const { h } = handlerWith({
