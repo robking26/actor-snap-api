@@ -52,6 +52,7 @@ function handlerWith(o = {}) {
     ...(o.limits ? { limits: o.limits } : {}),
     ...(o.lookupColours ? { lookupColours: o.lookupColours } : {}),
     ...(o.colourBudgetMs ? { colourBudgetMs: o.colourBudgetMs } : {}),
+    ...(o.warmColours ? { warmColours: o.warmColours } : {}),
   });
   return { h, calls };
 }
@@ -73,6 +74,25 @@ await t("400 empty body", async () => { const { res } = await run({}, { body: Bu
 await t("415 non-image", async () => { const { res } = await run({}, { body: Buffer.from("hello world") }); assert.equal(res.statusCode, 415); });
 await t("413 oversize", async () => { const big = Buffer.concat([JPEG, Buffer.alloc(MAX_IMAGE_BYTES)]); const { res } = await run({}, { body: big }); assert.equal(res.statusCode, 413); });
 await t("PNG accepted", async () => { const { res } = await run({}, { body: PNG }); assert.equal(res.statusCode, 200); });
+
+await t("the colour service is woken before recognition, not after it", async () => {
+  // The lookup cannot start until TMDB has named the credits, which is seconds in — and
+  // on a serverless deployment that is exactly when tvmdbhex is most likely to be cold.
+  // The warm-up is only worth anything if it goes first, so the order is the assertion.
+  const order = [];
+  await run({
+    warmColours: () => order.push("warm"),
+    recognise: async () => { order.push("recognise"); return { CelebrityFaces: [ineson], UnrecognizedFaces: [] }; },
+  });
+  assert.deepEqual(order, ["warm", "recognise"]);
+});
+
+await t("a request that was never going to be a scan wakes nothing", async () => {
+  // After the image is validated, deliberately: a 415 should not cost a cold start.
+  let warmed = 0;
+  await run({ warmColours: () => { warmed += 1; } }, { body: Buffer.from("hello world") });
+  assert.equal(warmed, 0);
+});
 await t("422 no face", async () => { const { res } = await run({ recognise: async () => ({ CelebrityFaces: [], UnrecognizedFaces: [] }) }); assert.equal(res.statusCode, 422); assert.equal(code(res), "no_face"); });
 await t("404 not_recognised when largest face unknown", async () => {
   const { res, calls } = await run({ recognise: async () => ({ CelebrityFaces: [{ ...ineson, Face: { BoundingBox: { Width: 0.05, Height: 0.05 } } }], UnrecognizedFaces: [{ BoundingBox: { Width: 0.4, Height: 0.5 } }] }) });

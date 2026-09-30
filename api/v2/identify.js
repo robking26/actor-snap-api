@@ -1,7 +1,7 @@
 import axios from "axios";
 import { RekognitionClient, RecognizeCelebritiesCommand } from "@aws-sdk/client-rekognition";
 import { createHandler } from "../../lib/hoozat.js";
-import { createColourLookup } from "../../lib/tvmdbhex.js";
+import { createColourLookup, createColourWarmUp } from "../../lib/tvmdbhex.js";
 import { DEFAULT_LIMITS, HOUR, DAY } from "../../lib/rate-limit.js";
 
 export const config = {
@@ -36,4 +36,8 @@ export default createHandler({
   // every credit's `colours` is null and Hoozat draws its brand palette — see
   // lib/tvmdbhex.js, which is also where the key never leaving this server is argued.
   lookupColours: createColourLookup({ apiKey: () => process.env.TVMDBHEX_API_KEY }),
+  // Same key, read the same way — at request time rather than at module load, so a key
+  // set in the Vercel dashboard takes effect on the next request rather than the next
+  // deploy.
+  warmColours: createColourWarmUp({ apiKey: () => process.env.TVMDBHEX_API_KEY }),
 });
